@@ -19,11 +19,23 @@ try:
     from common.phone_shopee_detector import contains_vietnam_phone_or_shopee_link
     from common.bank_spam_classifier import check_bank_spam
     from common.excluded_sites import excluded_sites_manager
-    COMMON_MODULES_AVAILABLE = True
+    print("✅ Using real common modules")
 except ImportError as e:
-    print(f"⚠️ Warning: Common modules not available: {e}")
-    print("   Running without preprocessing filters")
-    COMMON_MODULES_AVAILABLE = False
+    print(f"⚠️ Common modules not available: {e}")
+    print("   Using mock modules for testing...")
+    try:
+        from mock_common import (
+            registry, 
+            excluded_sites_manager, 
+            check_real_estate_spam, 
+            check_bank_spam, 
+            contains_vietnam_phone_or_shopee_link
+        )
+        print("✅ Using mock common modules")
+    except ImportError as e2:
+        print(f"❌ CRITICAL ERROR: Neither real nor mock modules available: {e2}")
+        print("   Service cannot start!")
+        exit(1)
 
 MODEL_ID = "Khoa/kompa-spam-filter-hospital-update-0625"
 MAX_LENGTH = 192
@@ -159,10 +171,6 @@ class SpamFilterService:
 
     def setup_filters(self):
         """Setup preprocessing filters"""
-        if not COMMON_MODULES_AVAILABLE:
-            print("⚠️ Common modules not available, skipping filter setup")
-            return
-            
         try:
             # Load filter registry config
             config_path = os.path.join(
@@ -201,11 +209,19 @@ class SpamFilterService:
                     if len(excluded_stats['sites']) > 5:
                         sites_str += f" ... (+{len(excluded_stats['sites']) - 5} more)"
                     print(f"   Sites: {sites_str}")
+                    
+                    # Check if our test site is in the list
+                    if "114144744928643" in excluded_stats['sites']:
+                        print(f"   ✅ Test site 114144744928643 is in excluded list")
+                    else:
+                        print(f"   ❌ Test site 114144744928643 is NOT in excluded list")
             else:
                 print(f"⚠️ Excluded sites config not found: {excluded_sites_config_path}")
                 
         except Exception as e:
-            print(f"⚠️ Error setting up filters: {e}")
+            print(f"❌ CRITICAL ERROR setting up filters: {e}")
+            print("   Service cannot continue without filters!")
+            exit(1)
         
         print(f"🤖 ML Model Status: {'ENABLED' if ML_ENABLE else 'DISABLED'}")
         if not ML_ENABLE:
@@ -244,23 +260,30 @@ class SpamFilterService:
 
     def apply_preprocessing_filters(self, item, mapped_category):
         """Apply preprocessing filters from ref_socket logic"""
-        if not COMMON_MODULES_AVAILABLE:
-            return None  # Skip preprocessing if modules not available
-            
         item_type = item.get("type", "")
         site_id = item.get("site_id", "")
         brand_id = str(item.get("index", ""))
         
+        # Debug logging
+        print(f"🔍 Processing item {item.get('id')}: site_id={site_id}, type={item_type}, brand_id={brand_id}")
+            
         # Pre-filter 0: Excluded sites - highest priority (bỏ qua không xử lý spam)
-        if excluded_sites_manager.is_excluded(site_id):
-            return {
-                "spam": False, 
-                "used_custom_filter": True, 
-                "filter_reason": "excluded_site"
-            }
+        try:
+            if excluded_sites_manager.is_excluded(site_id):
+                print(f"🚫 Site {site_id} is excluded for item {item.get('id')}")
+                return {
+                    "spam": False, 
+                    "used_custom_filter": True, 
+                    "filter_reason": "excluded_site"
+                }
+            else:
+                print(f"✅ Site {site_id} is NOT excluded for item {item.get('id')}")
+        except Exception as e:
+            print(f"⚠️ Error checking excluded sites for {item.get('id')}: {e}")
         
         # Pre-filter 1: newsTopic
         if item_type == "newsTopic":
+            print(f"📰 Item {item.get('id')} is newsTopic")
             return {
                 "spam": False, 
                 "used_custom_filter": False, 
@@ -274,31 +297,39 @@ class SpamFilterService:
             description = item.get("description", "")
             text = f"{title}\n{description}\n{content}".strip()
             
-            if contains_vietnam_phone_or_shopee_link(text):
-                return {
-                    "spam": True, 
-                    "used_custom_filter": True, 
-                    "filter_reason": "phone_shopee_detected"
-                }
+            try:
+                if contains_vietnam_phone_or_shopee_link(text):
+                    print(f"📱 Phone/Shopee detected for brand {brand_id}: {item.get('id')}")
+                    return {
+                        "spam": True, 
+                        "used_custom_filter": True, 
+                        "filter_reason": "phone_shopee_detected"
+                    }
+            except Exception as e:
+                print(f"⚠️ Error checking phone/shopee for {item.get('id')}: {e}")
         
         # Pre-filter 3: Custom brand filter
-        if registry.has_filter(brand_id):
-            custom_filter = registry.get_filter(brand_id)
-            filter_obj = {
-                "title": item.get("title", ""),
-                "content": item.get("content", ""),
-                "description": item.get("description", ""),
-                "topic": item.get("topic", ""),
-                "site_id": site_id,
-                "type": item_type,
-                "parent_id": item.get("parent_id", "")
-            }
-            is_spam_result = custom_filter(filter_obj)
-            return {
-                "spam": is_spam_result, 
-                "used_custom_filter": True, 
-                "filter_reason": "custom_brand_filter"
-            }
+        try:
+            if registry.has_filter(brand_id):
+                custom_filter = registry.get_filter(brand_id)
+                filter_obj = {
+                    "title": item.get("title", ""),
+                    "content": item.get("content", ""),
+                    "description": item.get("description", ""),
+                    "topic": item.get("topic", ""),
+                    "site_id": site_id,
+                    "type": item_type,
+                    "parent_id": item.get("parent_id", "")
+                }
+                is_spam_result = custom_filter(filter_obj)
+                print(f"🎯 Custom filter for brand {brand_id}: {item.get('id')} → spam={is_spam_result}")
+                return {
+                    "spam": is_spam_result, 
+                    "used_custom_filter": True, 
+                    "filter_reason": "custom_brand_filter"
+                }
+        except Exception as e:
+            print(f"⚠️ Error checking custom brand filter for {item.get('id')}: {e}")
         
         # Pre-filter 4: Real estate classified
         if mapped_category != "real_estate":
@@ -307,14 +338,18 @@ class SpamFilterService:
                 "content": item.get("content", ""),
                 "description": item.get("description", "")
             }
-            is_re_spam = check_real_estate_spam(filter_obj, mapped_category)
-            
-            if is_re_spam:
-                return {
-                    "spam": True, 
-                    "used_custom_filter": True, 
-                    "filter_reason": "real_estate_classified"
-                }
+            try:
+                is_re_spam = check_real_estate_spam(filter_obj, mapped_category)
+                
+                if is_re_spam:
+                    print(f"🏠 Real estate pre-filter: {item.get('id')} → spam=True (category={mapped_category})")
+                    return {
+                        "spam": True, 
+                        "used_custom_filter": True, 
+                        "filter_reason": "real_estate_classified"
+                    }
+            except Exception as e:
+                print(f"⚠️ Error checking real estate for {item.get('id')}: {e}")
         
         # Pre-filter 5: Bank spam classifier
         if mapped_category == "bank":
@@ -323,14 +358,19 @@ class SpamFilterService:
                 "content": item.get("content", ""),
                 "description": item.get("description", "")
             }
-            is_bank_spam = check_bank_spam(filter_obj, mapped_category)
-            if is_bank_spam:
-                return {
-                    "spam": True, 
-                    "used_custom_filter": True, 
-                    "filter_reason": "bank_spam_classified"
-                }
+            try:
+                is_bank_spam = check_bank_spam(filter_obj, mapped_category)
+                if is_bank_spam:
+                    print(f"🏦 Bank spam pre-filter: {item.get('id')} → spam=True (non-bank content in bank category)")
+                    return {
+                        "spam": True, 
+                        "used_custom_filter": True, 
+                        "filter_reason": "bank_spam_classified"
+                    }
+            except Exception as e:
+                print(f"⚠️ Error checking bank spam for {item.get('id')}: {e}")
         
+        print(f"➡️ No preprocessing filter applied for {item.get('id')}, proceeding to ML")
         return None  # No preprocessing filter applied, proceed to ML
 
     def process_infer_request(self, data):
