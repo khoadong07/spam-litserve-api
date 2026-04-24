@@ -26,7 +26,7 @@ SAMPLE_INFER_DATA = {
             "parent_id": "",
             "topic": "test"
         }
-        for i in range(10)  # 10 items per request
+        for i in range(40)  # 40 items per request
     ]
 }
 
@@ -39,7 +39,7 @@ SAMPLE_SPAM_DATA = {
             "content": f"This is spam test content {i}",
             "description": f"Spam test description {i}"
         }
-        for i in range(10)  # 10 items per request
+        for i in range(40)  # 40 items per request
     ]
 }
 
@@ -191,12 +191,19 @@ class APIBenchmark:
             print(f"❌ Error: {results['error']}")
             return
         
+        # Calculate items processed
+        items_per_request = 40  # Default batch size
+        total_items = results['successful_requests'] * items_per_request
+        items_per_second = total_items / results['total_time'] if results['total_time'] > 0 else 0
+        
         print(f"Total Requests: {results['total_requests']}")
         print(f"Successful: {results['successful_requests']}")
         print(f"Failed: {results['failed_requests']}")
         print(f"Success Rate: {results['success_rate']:.2f}%")
         print(f"Total Time: {results['total_time']:.2f}s")
         print(f"Overall RPS: {results['overall_rps']:.2f}")
+        print(f"Total Items Processed: {total_items}")
+        print(f"Items/Second: {items_per_second:.2f}")
         
         if "response_time" in results:
             rt = results["response_time"]
@@ -228,12 +235,12 @@ async def main():
                        help="Endpoint to test")
     parser.add_argument("--requests", type=int, default=100, help="Number of requests")
     parser.add_argument("--concurrency", type=int, default=10, help="Concurrent requests")
-    parser.add_argument("--items", type=int, default=10, help="Items per request")
+    parser.add_argument("--items", type=int, default=40, help="Items per request")
     
     args = parser.parse_args()
     
     # Adjust sample data size
-    if args.items != 10:
+    if args.items != 40:
         SAMPLE_INFER_DATA["data"] = SAMPLE_INFER_DATA["data"][:args.items]
         SAMPLE_SPAM_DATA["items"] = SAMPLE_SPAM_DATA["items"][:args.items]
     
