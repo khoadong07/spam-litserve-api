@@ -50,9 +50,9 @@ calculate_workers() {
     if [ "$WORKERS" = "auto" ]; then
         # Check for GPU
         if command -v nvidia-smi &> /dev/null && nvidia-smi > /dev/null 2>&1; then
-            # GPU detected - use fewer workers to avoid CUDA issues
-            WORKERS=2
-            print_info "GPU detected: Using $WORKERS workers for CUDA safety"
+            # GPU detected - MUST use single worker for CUDA safety
+            WORKERS=1
+            print_info "GPU detected: Using $WORKERS worker (CUDA multiprocessing safe)"
         else
             # CPU only - can use more workers
             CPU_CORES=$(nproc)
@@ -60,7 +60,12 @@ calculate_workers() {
             print_info "CPU workload: Using $WORKERS workers"
         fi
     else
-        print_info "Using specified workers: $WORKERS"
+        # If user specified workers > 1 with GPU, warn and force to 1
+        if command -v nvidia-smi &> /dev/null && nvidia-smi > /dev/null 2>&1 && [ "$WORKERS" -gt 1 ]; then
+            print_warning "GPU detected but WORKERS=$WORKERS specified. Forcing WORKERS=1 for CUDA safety"
+            WORKERS=1
+        fi
+        print_info "Using workers: $WORKERS"
     fi
 }
 
@@ -69,7 +74,7 @@ choose_server() {
     if [ "$SERVER" = "auto" ]; then
         if [ "$WORKERS" = "1" ]; then
             SERVER="python"
-            print_info "Single worker: Using Python directly"
+            print_info "Single worker: Using Python directly (best for GPU)"
         elif python -c "import gunicorn" 2>/dev/null; then
             SERVER="gunicorn"
             print_info "Multi-worker: Using Gunicorn"
