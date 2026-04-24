@@ -14,6 +14,11 @@ import logging
 import uvicorn
 from concurrent.futures import ThreadPoolExecutor
 import gc
+import multiprocessing
+
+# Fix CUDA multiprocessing issue
+if __name__ == "__main__":
+    multiprocessing.set_start_method('spawn', force=True)
 
 # Add parent directory to path to import common modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -240,12 +245,16 @@ class SpamFilterService:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = None
         self.model = None
-        self.executor = ThreadPoolExecutor(max_workers=4)  # For CPU-bound tasks
+        self.executor = ThreadPoolExecutor(max_workers=2)  # Reduced for GPU
         self.setup_model()
         self.setup_filters()
 
     def setup_model(self):
         print(f"Loading model on device: {self.device}")
+        
+        # Set CUDA multiprocessing sharing strategy
+        if self.device == "cuda":
+            torch.multiprocessing.set_sharing_strategy('file_system')
         
         self.tokenizer = AutoTokenizer.from_pretrained(
             MODEL_ID,
@@ -255,13 +264,15 @@ class SpamFilterService:
         self.model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_ID,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            device_map="auto" if self.device == "cuda" else None
+            device_map="auto" if self.device == "cuda" else None,
+            low_cpu_mem_usage=True
         ).to(self.device)
 
         if self.device == "cuda":
-            # Enable optimizations
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            # Enable optimizations but avoid torch.compile for multiprocessing
             torch.backends.cudnn.benchmark = True
+            # Don't use torch.compile with multiprocessing
+            print("GPU optimizations enabled (without torch.compile for multiprocessing compatibility)")
 
         self.model.eval()
 
@@ -698,6 +709,9 @@ async def root():
 
 
 if __name__ == "__main__":
+    # Fix CUDA multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
+    
     print("Starting High-Performance Spam Filter Service...")
     print(f"Model: {MODEL_ID}")
     print(f"Device: {spam_service.device}")
@@ -708,12 +722,12 @@ if __name__ == "__main__":
     print("- POST /v1/api/infer")
     print("- POST /api/spam")
     
-    # Production-optimized Uvicorn configuration
+    # Production-optimized Uvicorn configuration for single process
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8990,
-        workers=1,  # Single worker for GPU sharing
+        workers=1,  # IMPORTANT: Single worker for CUDA compatibility
         loop="uvloop",  # High-performance event loop
         http="httptools",  # High-performance HTTP parser
         access_log=False,  # Disable access logs for performance

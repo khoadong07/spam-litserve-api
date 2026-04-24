@@ -31,32 +31,36 @@ def run_gunicorn_server(host="0.0.0.0", port=8990, workers=None):
         return False
     
     if workers is None:
-        workers = get_optimal_workers()
+        # For GPU workloads, use fewer workers to avoid CUDA issues
+        workers = 1 if os.getenv("CUDA_VISIBLE_DEVICES") else get_optimal_workers()
     
-    # Gunicorn configuration for high performance
+    # Gunicorn configuration for high performance with CUDA safety
     gunicorn_config = [
         "main:app",
         f"--bind={host}:{port}",
         f"--workers={workers}",
         "--worker-class=uvicorn.workers.UvicornWorker",
         "--worker-connections=1000",
-        "--max-requests=10000",
-        "--max-requests-jitter=1000",
+        "--max-requests=5000",  # Lower for GPU memory management
+        "--max-requests-jitter=500",
         "--preload",  # Preload app for memory sharing
         "--timeout=120",
         "--keep-alive=5",
         "--access-logfile=-",
         "--error-logfile=-",
         "--log-level=info",
-        # Performance optimizations
-        "--worker-tmp-dir=/dev/shm",  # Use shared memory for worker temp files
-        "--enable-stdio-inheritance",
+        # CUDA-safe settings
+        "--worker-tmp-dir=/tmp",
     ]
     
     print(f"🚀 Starting Gunicorn server with {workers} workers...")
     print(f"   Host: {host}:{port}")
     print(f"   Worker class: uvicorn.workers.UvicornWorker")
-    print(f"   Max connections per worker: 1000")
+    print(f"   CUDA-safe configuration enabled")
+    
+    # Set multiprocessing method before starting
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
     
     os.execvp("gunicorn", ["gunicorn"] + gunicorn_config)
 
@@ -122,6 +126,10 @@ def optimize_system():
     """Apply system-level optimizations"""
     print("🔧 Applying system optimizations...")
     
+    # Set multiprocessing method for CUDA compatibility
+    import multiprocessing
+    multiprocessing.set_start_method('spawn', force=True)
+    
     # Set environment variables for optimal performance
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
@@ -129,6 +137,7 @@ def optimize_system():
     # PyTorch optimizations
     os.environ.setdefault("TORCH_CUDNN_V8_API_ENABLED", "1")
     os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "0")
+    os.environ.setdefault("TORCH_MULTIPROCESSING_SHARING_STRATEGY", "file_system")
     
     # Memory optimizations
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
@@ -136,7 +145,8 @@ def optimize_system():
     # Disable tokenizers parallelism warnings
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     
-    print("✅ System optimizations applied")
+    print("✅ System optimizations applied (CUDA-safe)")
+    print("✅ Multiprocessing method set to 'spawn'")
 
 def main():
     parser = argparse.ArgumentParser(description="Production Spam Filter Server")
