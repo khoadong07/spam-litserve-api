@@ -17,12 +17,6 @@ import argparse
 import sys
 from pathlib import Path
 
-import pandas as pd
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment
-from openpyxl.utils import get_column_letter
-
-
 # =============================================================================
 # KEYWORD LISTS — chỉnh sửa tại đây để cập nhật rules
 # =============================================================================
