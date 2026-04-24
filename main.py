@@ -264,8 +264,7 @@ class SpamFilterService:
         self.model = AutoModelForSequenceClassification.from_pretrained(
             MODEL_ID,
             torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
-            device_map="auto" if self.device == "cuda" else None,
-            low_cpu_mem_usage=True
+            # Remove device_map and low_cpu_mem_usage for compatibility
         ).to(self.device)
 
         if self.device == "cuda":
@@ -284,9 +283,9 @@ class SpamFilterService:
     def setup_filters(self):
         """Setup preprocessing filters"""
         try:
-            # Load filter registry config
+            # Load filter registry config - fix path
             config_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                os.path.dirname(os.path.abspath(__file__)),  # Current directory instead of parent
                 'config',
                 'brand_filters.json'
             )
@@ -302,10 +301,14 @@ class SpamFilterService:
                     print(f"   - {filter_name}: {count} brands")
             else:
                 print(f"⚠️ Filter config not found: {config_path}")
+                print(f"   Creating empty config...")
+                os.makedirs(os.path.dirname(config_path), exist_ok=True)
+                with open(config_path, 'w') as f:
+                    json.dump({"brand_filters": {}}, f, indent=2)
             
-            # Load excluded sites config
+            # Load excluded sites config - fix path
             excluded_sites_config_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                os.path.dirname(os.path.abspath(__file__)),  # Current directory instead of parent
                 'config',
                 'excluded_sites.json'
             )
@@ -329,6 +332,10 @@ class SpamFilterService:
                         print(f"   ❌ Test site 114144744928643 is NOT in excluded list")
             else:
                 print(f"⚠️ Excluded sites config not found: {excluded_sites_config_path}")
+                print(f"   Creating empty config...")
+                os.makedirs(os.path.dirname(excluded_sites_config_path), exist_ok=True)
+                with open(excluded_sites_config_path, 'w') as f:
+                    json.dump({"excluded_sites": []}, f, indent=2)
                 
         except Exception as e:
             print(f"❌ CRITICAL ERROR setting up filters: {e}")

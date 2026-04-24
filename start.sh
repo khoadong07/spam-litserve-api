@@ -100,13 +100,20 @@ echo "  Virtual Env: $VENV_PATH"
 # Check basic dependencies
 python -c "import torch, transformers, fastapi" 2>/dev/null || {
     print_error "Missing dependencies!"
-    print_info "Please install PyTorch first:"
+    print_info "Please install dependencies first:"
     echo "  ./install_pytorch.sh"
     echo "  # or manually:"
     echo "  source $VENV_PATH/bin/activate"
     echo "  pip install torch==2.5.1+cu121 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121"
-    echo "  pip install transformers==4.44.2 tokenizers==0.19.1 huggingface-hub==0.24.7 fastapi uvicorn[standard]"
+    echo "  pip install transformers fastapi uvicorn[standard] accelerate"
     exit 1
+}
+
+# Check for accelerate (required for model loading)
+python -c "import accelerate" 2>/dev/null || {
+    print_error "Missing accelerate package!"
+    print_info "Installing accelerate..."
+    pip install accelerate
 }
 
 print_success "Dependencies OK"
