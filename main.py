@@ -686,6 +686,7 @@ async def add_process_time_header(request: Request, call_next):
 
 # Performance tracking
 request_count = 0
+items_processed = 0
 start_time_global = time.time()
 
 @app.middleware("http") 
