@@ -1,9 +1,9 @@
 #!/bin/bash
 
-# Production deployment script for Spam Filter API (Non-Docker)
+# Production deployment script for Spam Filter API (CUDA-Safe)
 set -e
 
-echo "🚀 Starting Production Spam Filter API (Non-Docker)"
+echo "🚀 Starting Production Spam Filter API (CUDA-Safe)"
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,8 +15,8 @@ NC='\033[0m' # No Color
 # Configuration
 HOST=${HOST:-"0.0.0.0"}
 PORT=${PORT:-8990}
-WORKERS=${WORKERS:-"auto"}
-SERVER=${SERVER:-"gunicorn"}
+WORKERS=${WORKERS:-"1"}  # Default 1 for GPU safety
+SERVER=${SERVER:-"uvicorn"}  # Changed default to uvicorn for better CUDA support
 ML_ENABLE=${ML_ENABLE:-"true"}
 VENV_PATH=${VENV_PATH:-"venv"}
 
@@ -40,15 +40,18 @@ print_error() {
 # Check if virtual environment exists
 check_venv() {
     if [ ! -d "$VENV_PATH" ]; then
-        print_error "Virtual environment not found at $VENV_PATH"
-        print_status "Please run setup_production.sh first or create virtual environment:"
-        echo "  python3 -m venv $VENV_PATH"
-        echo "  source $VENV_PATH/bin/activate"
-        echo "  pip install -r requirements.txt"
-        exit 1
+        print_warning "Virtual environment not found at $VENV_PATH"
+        print_status "Creating virtual environment..."
+        python3 -m venv "$VENV_PATH"
+        source "$VENV_PATH/bin/activate"
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install gunicorn uvicorn[standard]
+        print_success "Virtual environment created and dependencies installed"
+    else
+        print_success "Virtual environment found at $VENV_PATH"
+        source "$VENV_PATH/bin/activate"
     fi
-    
-    print_success "Virtual environment found at $VENV_PATH"
 }
 
 # Activate virtual environment
@@ -72,8 +75,19 @@ check_requirements() {
         nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv,noheader,nounits | while read line; do
             echo "  GPU: $line"
         done
+        # Force single worker for GPU safety
+        if [ "$WORKERS" != "1" ] && [ "$SERVER" != "python" ]; then
+            print_warning "GPU detected: Forcing WORKERS=1 for CUDA safety"
+            WORKERS=1
+        fi
     else
         print_warning "No NVIDIA GPU detected, using CPU"
+        # Can use more workers for CPU
+        if [ "$WORKERS" = "1" ] && [ "$SERVER" != "python" ]; then
+            CPU_CORES=$(nproc)
+            WORKERS=$((CPU_CORES > 4 ? 4 : CPU_CORES))
+            print_status "CPU workload: Using $WORKERS workers"
+        fi
     fi
     
     # Check memory
@@ -99,42 +113,43 @@ check_dependencies() {
     print_status "Checking Python dependencies..."
     
     # Check if required packages are installed
-    python -c "import torch; print(f'PyTorch: {torch.__version__}')" || {
-        print_error "PyTorch not found. Installing dependencies..."
+    python -c "import torch; print(f'PyTorch: {torch.__version__}')" 2>/dev/null || {
+        print_warning "PyTorch not found. Installing dependencies..."
         pip install -r requirements.txt
     }
     
-    python -c "import transformers; print(f'Transformers: {transformers.__version__}')" || {
-        print_error "Transformers not found. Installing dependencies..."
+    python -c "import transformers; print(f'Transformers: {transformers.__version__}')" 2>/dev/null || {
+        print_warning "Transformers not found. Installing dependencies..."
         pip install -r requirements.txt
     }
     
-    python -c "import fastapi; print(f'FastAPI: {fastapi.__version__}')" || {
-        print_error "FastAPI not found. Installing dependencies..."
+    python -c "import fastapi; print(f'FastAPI: {fastapi.__version__}')" 2>/dev/null || {
+        print_warning "FastAPI not found. Installing dependencies..."
         pip install -r requirements.txt
     }
     
     # Check server dependencies
     if [ "$SERVER" = "gunicorn" ]; then
-        python -c "import gunicorn" || pip install gunicorn
-    elif [ "$SERVER" = "hypercorn" ]; then
-        python -c "import hypercorn" || pip install hypercorn
+        python -c "import gunicorn" 2>/dev/null || pip install gunicorn
+    elif [ "$SERVER" = "uvicorn" ]; then
+        python -c "import uvicorn" 2>/dev/null || pip install uvicorn[standard]
     fi
     
     print_success "Dependencies checked"
 }
 
-# Optimize system settings
+# Optimize system settings (CUDA-safe)
 optimize_system() {
-    print_status "Applying system optimizations..."
+    print_status "Applying CUDA-safe system optimizations..."
     
-    # Set environment variables
+    # Set environment variables for CUDA safety
     export PYTHONUNBUFFERED=1
     export PYTHONDONTWRITEBYTECODE=1
+    export ML_ENABLE=$ML_ENABLE
+    export TOKENIZERS_PARALLELISM=false
     export TORCH_CUDNN_V8_API_ENABLED=1
     export CUDA_LAUNCH_BLOCKING=0
-    export TOKENIZERS_PARALLELISM=false
-    export ML_ENABLE=$ML_ENABLE
+    export TORCH_MULTIPROCESSING_SHARING_STRATEGY=file_system
     
     # Memory optimizations
     export MALLOC_ARENA_MAX=2
@@ -146,7 +161,8 @@ optimize_system() {
     # Increase file descriptor limits (if possible)
     ulimit -n 65536 2>/dev/null || print_warning "Could not increase file descriptor limit"
     
-    print_success "System optimizations applied"
+    print_success "CUDA-safe system optimizations applied"
+    print_status "Multiprocessing will use 'spawn' method for CUDA compatibility"
 }
 
 # Create necessary directories
@@ -172,7 +188,7 @@ health_check() {
             print_success "API is healthy and ready!"
             
             # Show API info
-            API_INFO=$(curl -s "http://$HOST:$PORT/health" | python -m json.tool 2>/dev/null || echo "API responding")
+            API_INFO=$(curl -s "http://$HOST:$PORT/health" 2>/dev/null | python -m json.tool 2>/dev/null || echo "API responding")
             echo "$API_INFO"
             return 0
         fi
@@ -186,27 +202,9 @@ health_check() {
     return 1
 }
 
-# Calculate optimal workers
-calculate_workers() {
-    if [ "$WORKERS" = "auto" ]; then
-        if [ -n "$CUDA_VISIBLE_DEVICES" ] || command -v nvidia-smi &> /dev/null; then
-            # GPU workload - limit workers to prevent GPU memory issues
-            WORKERS=2
-            print_status "GPU detected: Using $WORKERS workers"
-        else
-            # CPU workload
-            WORKERS=$(($(nproc) * 2 + 1))
-            if [ $WORKERS -gt 8 ]; then
-                WORKERS=8
-            fi
-            print_status "CPU workload: Using $WORKERS workers"
-        fi
-    fi
-}
-
-# Start server function
+# Start server function (CUDA-safe)
 start_server() {
-    print_status "Starting production server..."
+    print_status "Starting CUDA-safe production server..."
     print_status "Configuration:"
     echo "  Host: $HOST"
     echo "  Port: $PORT"
@@ -214,76 +212,59 @@ start_server() {
     echo "  Server: $SERVER"
     echo "  ML Enabled: $ML_ENABLE"
     echo "  Virtual Env: $VENV_PATH"
+    echo "  CUDA Safe: Yes (spawn method)"
     
-    calculate_workers
-    
-    if [ "$SERVER" = "gunicorn" ]; then
-        print_status "Starting Gunicorn with $WORKERS workers..."
-        exec gunicorn main:app \
-            --bind="$HOST:$PORT" \
-            --workers="$WORKERS" \
-            --worker-class=uvicorn.workers.UvicornWorker \
-            --worker-connections=1000 \
-            --max-requests=10000 \
-            --max-requests-jitter=1000 \
-            --preload \
-            --timeout=120 \
-            --keep-alive=5 \
-            --access-logfile=logs/access.log \
-            --error-logfile=logs/error.log \
-            --log-level=info \
-            --worker-tmp-dir=/tmp \
-            --enable-stdio-inheritance \
-            --capture-output
-            
-    elif [ "$SERVER" = "uvicorn" ]; then
-        print_status "Starting Uvicorn with $WORKERS workers..."
-        exec uvicorn main:app \
-            --host "$HOST" \
-            --port "$PORT" \
-            --workers "$WORKERS" \
-            --loop uvloop \
-            --http httptools \
-            --access-log \
-            --log-level info \
-            --no-use-colors \
-            --backlog 2048 \
-            --limit-concurrency 2000 \
-            --limit-max-requests 20000 \
-            --timeout-keep-alive 10
-            
-    elif [ "$SERVER" = "hypercorn" ]; then
-        print_status "Starting Hypercorn with $WORKERS workers..."
-        exec hypercorn main:app \
-            --bind "$HOST:$PORT" \
-            --workers "$WORKERS" \
-            --worker-class asyncio \
-            --backlog 2048 \
-            --max-requests 10000 \
-            --keep-alive-timeout 10 \
-            --graceful-timeout 30 \
-            --access-log logs/access.log \
-            --error-log logs/error.log
-            
-    elif [ "$SERVER" = "python" ]; then
-        print_status "Starting with Python production server..."
-        exec python production_server.py \
-            --server gunicorn \
-            --host "$HOST" \
-            --port "$PORT" \
-            --workers "$WORKERS"
-    else
-        print_error "Unknown server: $SERVER"
-        print_status "Available servers: gunicorn, uvicorn, hypercorn, python"
-        exit 1
-    fi
+    case "$SERVER" in
+        "gunicorn")
+            print_status "Starting Gunicorn with CUDA-safe configuration..."
+            exec gunicorn main:app \
+                --bind="$HOST:$PORT" \
+                --workers="$WORKERS" \
+                --worker-class=uvicorn.workers.UvicornWorker \
+                --worker-connections=1000 \
+                --max-requests=5000 \
+                --max-requests-jitter=500 \
+                --preload \
+                --timeout=120 \
+                --keep-alive=5 \
+                --access-logfile=logs/access.log \
+                --error-logfile=logs/error.log \
+                --log-level=info \
+                --worker-tmp-dir=/tmp
+            ;;
+        "uvicorn")
+            print_status "Starting Uvicorn with CUDA-safe configuration..."
+            exec uvicorn main:app \
+                --host "$HOST" \
+                --port "$PORT" \
+                --workers "$WORKERS" \
+                --loop uvloop \
+                --http httptools \
+                --access-log \
+                --log-level info \
+                --no-use-colors \
+                --backlog 2048 \
+                --limit-concurrency 2000 \
+                --limit-max-requests 10000 \
+                --timeout-keep-alive 10
+            ;;
+        "python")
+            print_status "Starting with Python (CUDA-safe)..."
+            exec python main.py
+            ;;
+        *)
+            print_error "Unknown server: $SERVER"
+            print_status "Available servers: gunicorn, uvicorn, python"
+            exit 1
+            ;;
+    esac
 }
 
 # Show usage information
 show_usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Production deployment script for Spam Filter API (Non-Docker)"
+    echo "CUDA-safe production deployment script for Spam Filter API"
     echo ""
     echo "Options:"
     echo "  --with-health-check    Perform health check after startup"
@@ -293,26 +274,31 @@ show_usage() {
     echo "Environment Variables:"
     echo "  HOST                  Host to bind to (default: 0.0.0.0)"
     echo "  PORT                  Port to bind to (default: 8990)"
-    echo "  WORKERS               Number of workers (default: auto)"
-    echo "  SERVER                Server type: gunicorn|uvicorn|hypercorn|python (default: gunicorn)"
+    echo "  WORKERS               Number of workers (default: 1 for GPU safety)"
+    echo "  SERVER                Server type: gunicorn|uvicorn|python (default: uvicorn)"
     echo "  ML_ENABLE             Enable ML inference (default: true)"
     echo "  VENV_PATH             Virtual environment path (default: venv)"
     echo ""
     echo "Examples:"
-    echo "  $0                                    # Start with default settings"
+    echo "  $0                                    # Start with CUDA-safe defaults"
     echo "  $0 --setup                           # Setup environment first, then start"
-    echo "  SERVER=uvicorn WORKERS=1 $0          # Start with Uvicorn, 1 worker"
+    echo "  SERVER=python $0                     # Use Python directly (simplest)"
+    echo "  WORKERS=2 SERVER=gunicorn $0         # Gunicorn with 2 workers (CPU only)"
     echo "  ML_ENABLE=false $0                   # Start with ML disabled"
     echo "  HOST=127.0.0.1 PORT=9000 $0         # Custom host and port"
     echo ""
-    echo "Quick Setup:"
-    echo "  1. ./setup_production.sh             # One-time setup"
+    echo "CUDA Safety Features:"
+    echo "  - Automatic spawn multiprocessing method"
+    echo "  - Single worker default for GPU workloads"
+    echo "  - Optimized environment variables"
+    echo "  - Memory management optimizations"
+    echo ""
+    echo "Quick Start:"
+    echo "  1. $0 --setup                        # One-time setup"
     echo "  2. $0                                # Start server"
     echo ""
-    echo "Service Management:"
-    echo "  sudo systemctl start spam-filter-api    # Start as service"
-    echo "  sudo systemctl status spam-filter-api   # Check status"
-    echo "  sudo systemctl stop spam-filter-api     # Stop service"
+    echo "Simple Alternative:"
+    echo "  python3 run.py                       # Ultra-simple runner"
 }
 
 # Setup function
@@ -336,7 +322,7 @@ run_setup() {
     fi
     
     # Install production servers
-    pip install gunicorn hypercorn uvicorn[standard]
+    pip install gunicorn uvicorn[standard]
     
     print_success "Quick setup completed"
 }
@@ -345,7 +331,7 @@ run_setup() {
 cleanup() {
     print_status "Cleaning up..."
     # Kill any remaining processes
-    pkill -f "gunicorn\|uvicorn\|hypercorn" 2>/dev/null || true
+    pkill -f "gunicorn\|uvicorn\|main.py" 2>/dev/null || true
 }
 
 # Signal handlers
@@ -354,8 +340,8 @@ trap 'print_error "Interrupted"; exit 1' INT TERM
 
 # Main execution
 main() {
-    print_status "Production Spam Filter API (Non-Docker)"
-    print_status "======================================="
+    print_status "Production Spam Filter API (CUDA-Safe)"
+    print_status "======================================"
     
     # Handle setup option
     if [ "$1" = "--setup" ]; then
@@ -381,6 +367,12 @@ main() {
         # Wait for health check
         if health_check; then
             print_success "Server started successfully (PID: $SERVER_PID)"
+            print_status "🌐 API URL: http://$HOST:$PORT"
+            print_status "📋 Available endpoints:"
+            echo "   - GET  http://$HOST:$PORT/health"
+            echo "   - GET  http://$HOST:$PORT/"
+            echo "   - POST http://$HOST:$PORT/v1/api/infer"
+            echo "   - POST http://$HOST:$PORT/api/spam"
             print_status "Server is running. Press Ctrl+C to stop."
             wait $SERVER_PID
         else
