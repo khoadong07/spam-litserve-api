@@ -673,6 +673,34 @@ async def add_process_time_header(request: Request, call_next):
     response = await call_next(request)
     process_time = time.time() - start_time
     response.headers["X-Process-Time"] = str(process_time)
+    
+    # Log performance metrics
+    method = request.method
+    url = str(request.url.path)
+    status = response.status_code
+    
+    # Log every request with timing
+    print(f"⚡ {method} {url} - {status} - {process_time:.3f}s")
+    
+    return response
+
+# Performance tracking
+request_count = 0
+start_time_global = time.time()
+
+@app.middleware("http") 
+async def performance_tracking(request: Request, call_next):
+    global request_count, start_time_global
+    
+    request_count += 1
+    response = await call_next(request)
+    
+    # Log performance stats every 10 requests
+    if request_count % 10 == 0:
+        elapsed = time.time() - start_time_global
+        rps = request_count / elapsed if elapsed > 0 else 0
+        print(f"📊 Performance: {request_count} requests in {elapsed:.1f}s = {rps:.2f} req/s")
+    
     return response
 
 @app.get('/health')
