@@ -19,6 +19,7 @@ try:
     from common.phone_shopee_detector import contains_vietnam_phone_or_shopee_link
     from common.bank_spam_classifier import check_bank_spam
     from common.excluded_sites import excluded_sites_manager
+    from common.cake_custom_filter import classify_row
     print("✅ Using real common modules")
 except ImportError as e:
     print(f"⚠️ Common modules not available: {e}")
@@ -31,6 +32,12 @@ except ImportError as e:
             check_bank_spam, 
             contains_vietnam_phone_or_shopee_link
         )
+        
+        # Mock cake filter function
+        def classify_row(row_dict):
+            """Mock cake filter - always returns NO spam for testing"""
+            return "NO", "MOCK_CAKE_FILTER"
+            
         print("✅ Using mock common modules")
     except ImportError as e2:
         print(f"❌ CRITICAL ERROR: Neither real nor mock modules available: {e2}")
@@ -281,7 +288,29 @@ class SpamFilterService:
         except Exception as e:
             print(f"⚠️ Error checking excluded sites for {item.get('id')}: {e}")
         
-        # Pre-filter 1: newsTopic
+        # Pre-filter 1: CAKE Custom Filter for specific brand
+        if brand_id == "61b8715499ce4372a5d739a0":
+            try:
+                # Prepare data for cake filter
+                row_data = {
+                    "Title": item.get("title", ""),
+                    "Content": item.get("content", ""),
+                    "Description": item.get("description", "")
+                }
+                
+                is_spam_result, spam_reason = classify_row(row_data)
+                spam_bool = is_spam_result == "YES"
+                
+                print(f"🍰 CAKE filter for brand {brand_id}: {item.get('id')} → spam={spam_bool} ({spam_reason})")
+                return {
+                    "spam": spam_bool, 
+                    "used_custom_filter": True, 
+                    "filter_reason": f"cake_custom_filter_{spam_reason.lower()}"
+                }
+            except Exception as e:
+                print(f"⚠️ Error in CAKE custom filter for {item.get('id')}: {e}")
+        
+        # Pre-filter 2: newsTopic
         if item_type == "newsTopic":
             print(f"📰 Item {item.get('id')} is newsTopic")
             return {
@@ -290,7 +319,7 @@ class SpamFilterService:
                 "filter_reason": "news_topic"
             }
         
-        # Pre-filter 2: Phone/Shopee detection
+        # Pre-filter 3: Phone/Shopee detection
         if brand_id in BRAND_SENTIMENT_INDICES:
             title = item.get("title", "")
             content = item.get("content", "")
@@ -308,7 +337,7 @@ class SpamFilterService:
             except Exception as e:
                 print(f"⚠️ Error checking phone/shopee for {item.get('id')}: {e}")
         
-        # Pre-filter 3: Custom brand filter
+        # Pre-filter 4: Custom brand filter (registry)
         try:
             if registry.has_filter(brand_id):
                 custom_filter = registry.get_filter(brand_id)
@@ -331,7 +360,7 @@ class SpamFilterService:
         except Exception as e:
             print(f"⚠️ Error checking custom brand filter for {item.get('id')}: {e}")
         
-        # Pre-filter 4: Real estate classified
+        # Pre-filter 5: Real estate classified
         if mapped_category != "real_estate":
             filter_obj = {
                 "title": item.get("title", ""),
@@ -351,7 +380,7 @@ class SpamFilterService:
             except Exception as e:
                 print(f"⚠️ Error checking real estate for {item.get('id')}: {e}")
         
-        # Pre-filter 5: Bank spam classifier
+        # Pre-filter 6: Bank spam classifier
         if mapped_category == "bank":
             filter_obj = {
                 "title": item.get("title", ""),
