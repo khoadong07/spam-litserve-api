@@ -1,14 +1,19 @@
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from typing import List, Dict, Any, Union
-import threading
+import asyncio
 import time
-from flask import Flask, request, jsonify
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 import json
 import re
 import os
 import sys
 import logging
+import uvicorn
+from concurrent.futures import ThreadPoolExecutor
+import gc
 
 # Add parent directory to path to import common modules
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -204,11 +209,38 @@ def is_meaningful_data(obj: dict) -> bool:
     return True
 
 
+# Pydantic models for request/response validation
+class InferItem(BaseModel):
+    id: str
+    index: str
+    category: str = ""
+    type: str = ""
+    title: str = ""
+    content: str = ""
+    description: str = ""
+    site_id: str = ""
+    parent_id: str = ""
+    topic: str = ""
+
+class InferRequest(BaseModel):
+    data: List[InferItem]
+
+class SpamItem(BaseModel):
+    id: str
+    index: str
+    title: str = ""
+    content: str = ""
+    description: str = ""
+
+class SpamRequest(BaseModel):
+    items: List[SpamItem]
+
 class SpamFilterService:
     def __init__(self):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = None
         self.model = None
+        self.executor = ThreadPoolExecutor(max_workers=4)  # For CPU-bound tasks
         self.setup_model()
         self.setup_filters()
 
@@ -221,17 +253,22 @@ class SpamFilterService:
         )
 
         self.model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL_ID
+            MODEL_ID,
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32,
+            device_map="auto" if self.device == "cuda" else None
         ).to(self.device)
 
         if self.device == "cuda":
-            self.model.half()
+            # Enable optimizations
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            torch.backends.cudnn.benchmark = True
 
         self.model.eval()
 
         print("Model loaded successfully!")
         if self.device == "cuda":
             print("GPU:", torch.cuda.get_device_name(0))
+            print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
 
     def setup_filters(self):
         """Setup preprocessing filters"""
@@ -292,35 +329,58 @@ class SpamFilterService:
             print(f"   All items passing pre-filters will be marked as spam=False")
 
     @torch.inference_mode()
-    def predict_spam(self, texts):
+    def predict_spam(self, texts, batch_size=32):
         if not texts:
             return []
 
-        encoded = self.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=MAX_LENGTH,
-            return_tensors="pt"
-        ).to(self.device)
-
-        outputs = self.model(**encoded)
-        probs = torch.softmax(outputs.logits, dim=-1)
-        preds = torch.argmax(probs, dim=-1)
-
         results = []
-        for pred, prob in zip(preds.cpu().tolist(), probs.cpu().tolist()):
-            label = self.model.config.id2label[pred]
-            score = float(max(prob))
-            is_spam = label.lower() in ["spam", "label_1", "1", "true"]
+        
+        # Process in batches for better memory management
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i:i + batch_size]
             
-            results.append({
-                "label": label,
-                "score": score,
-                "is_spam": is_spam
-            })
+            encoded = self.tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=MAX_LENGTH,
+                return_tensors="pt"
+            ).to(self.device)
+
+            with torch.cuda.amp.autocast(enabled=self.device == "cuda"):
+                outputs = self.model(**encoded)
+                probs = torch.softmax(outputs.logits, dim=-1)
+                preds = torch.argmax(probs, dim=-1)
+
+            batch_results = []
+            for pred, prob in zip(preds.cpu().tolist(), probs.cpu().tolist()):
+                label = self.model.config.id2label[pred]
+                score = float(max(prob))
+                is_spam = label.lower() in ["spam", "label_1", "1", "true"]
+                
+                batch_results.append({
+                    "label": label,
+                    "score": score,
+                    "is_spam": is_spam
+                })
+            
+            results.extend(batch_results)
+            
+            # Clear GPU cache periodically
+            if self.device == "cuda" and i % (batch_size * 4) == 0:
+                torch.cuda.empty_cache()
 
         return results
+
+    async def predict_spam_async(self, texts, batch_size=32):
+        """Async wrapper for predict_spam"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self.executor, 
+            self.predict_spam, 
+            texts, 
+            batch_size
+        )
 
     def apply_preprocessing_filters(self, item, mapped_category):
         """Apply preprocessing filters from ref_socket logic"""
@@ -459,20 +519,20 @@ class SpamFilterService:
         print(f"➡️ No preprocessing filter applied for {item.get('id')}, proceeding to ML")
         return None  # No preprocessing filter applied, proceed to ML
 
-    def process_infer_request(self, data):
+    async def process_infer_request(self, data: InferRequest):
         """Process v1/api/infer request with preprocessing filters"""
-        items = data.get("data", [])
+        items = data.data
         
         results = []
 
         for item in items:
             # Map category
-            category = item.get("category", "") or ""
+            category = item.category or ""
             mapped_category = CATEGORY_MAPPING.get(category, category)
             mapped_category = mapped_category.lower()
             
             # Apply preprocessing filters
-            preprocess_result = self.apply_preprocessing_filters(item, mapped_category)
+            preprocess_result = self.apply_preprocessing_filters(item.dict(), mapped_category)
             
             if preprocess_result is not None:
                 # Preprocessing filter applied
@@ -482,7 +542,7 @@ class SpamFilterService:
                 
                 # Apply meaningful data check for spam items from non-custom filters
                 if spam and not used_custom_filter:
-                    is_meaningful = is_meaningful_data(item)
+                    is_meaningful = is_meaningful_data(item.dict())
                     if is_meaningful:
                         spam = False
                         filter_reason = "meaningful_data_override"
@@ -492,17 +552,17 @@ class SpamFilterService:
                 if ML_ENABLE:
                     # Combine title, description, and content for inference
                     text_parts = []
-                    if item.get("title"):
-                        text_parts.append(str(item["title"]))
-                    if item.get("description"):
-                        text_parts.append(str(item["description"]))
-                    if item.get("content"):
-                        text_parts.append(str(item["content"]))
+                    if item.title:
+                        text_parts.append(str(item.title))
+                    if item.description:
+                        text_parts.append(str(item.description))
+                    if item.content:
+                        text_parts.append(str(item.content))
                     
                     text = " ".join(text_parts).strip()
                     
                     if text:
-                        predictions = self.predict_spam([text])
+                        predictions = await self.predict_spam_async([text])
                         if predictions:
                             pred = predictions[0]
                             spam = pred["is_spam"]
@@ -522,10 +582,10 @@ class SpamFilterService:
                     filter_reason = "ml_disabled"
 
             result = {
-                "id": item.get("id"),
-                "index": item.get("index"),
+                "id": item.id,
+                "index": item.index,
                 "category": mapped_category,
-                "type": item.get("type"),
+                "type": item.type,
                 "spam": spam,
                 "used_custom_filter": used_custom_filter,
                 "filter_reason": filter_reason
@@ -537,28 +597,28 @@ class SpamFilterService:
             "data": results
         }
 
-    def process_spam_request(self, data):
+    async def process_spam_request(self, data: SpamRequest):
         """Process original spam API request"""
-        items = data.get("items", [])
+        items = data.items
         
         texts = []
         meta_list = []
 
         for item in items:
             text = " ".join([
-                str(item.get("title") or ""),
-                str(item.get("content") or ""),
-                str(item.get("description") or "")
+                str(item.title or ""),
+                str(item.content or ""),
+                str(item.description or "")
             ]).strip()
 
             texts.append(text)
             meta_list.append({
-                "id": item.get("id"),
-                "index": item.get("index")
+                "id": item.id,
+                "index": item.index
             })
 
         # Get predictions
-        predictions = self.predict_spam(texts)
+        predictions = await self.predict_spam_async(texts)
         
         # Format response
         results = []
@@ -581,74 +641,88 @@ class SpamFilterService:
 # Initialize service
 spam_service = SpamFilterService()
 
-# Create Flask app
-app = Flask(__name__)
+# Create FastAPI app
+app = FastAPI(
+    title="Spam Filter API",
+    description="High-performance spam detection service",
+    version="2.0.0"
+)
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
+# Add middleware for performance monitoring
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
+
+@app.get('/health')
+async def health_check():
+    return {
         "status": "healthy",
         "device": spam_service.device,
-        "model": MODEL_ID
-    })
+        "model": MODEL_ID,
+        "ml_enabled": ML_ENABLE
+    }
 
-@app.route('/v1/api/infer', methods=['POST'])
-def infer_api():
+@app.post('/v1/api/infer')
+async def infer_api(data: InferRequest):
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-        
-        result = spam_service.process_infer_request(data)
-        return jsonify(result)
-    
+        result = await spam_service.process_infer_request(data)
+        return result
     except Exception as e:
-        return jsonify({
-            "status": 500,
-            "error": str(e)
-        }), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/api/spam', methods=['POST'])
-def spam_api():
+@app.post('/api/spam')
+async def spam_api(data: SpamRequest):
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-        
-        result = spam_service.process_spam_request(data)
-        return jsonify(result)
-    
+        result = await spam_service.process_spam_request(data)
+        return result
     except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.route('/', methods=['GET'])
-def root():
-    return jsonify({
+@app.get('/')
+async def root():
+    return {
         "service": "Spam Filter API",
+        "version": "2.0.0",
         "endpoints": {
             "health": "GET /health",
             "infer": "POST /v1/api/infer",
             "spam": "POST /api/spam"
         },
-        "model": MODEL_ID
-    })
+        "model": MODEL_ID,
+        "ml_enabled": ML_ENABLE
+    }
 
 
 if __name__ == "__main__":
-    print("Starting Spam Filter Service...")
+    print("Starting High-Performance Spam Filter Service...")
     print(f"Model: {MODEL_ID}")
     print(f"Device: {spam_service.device}")
+    print(f"ML Enabled: {ML_ENABLE}")
     print("\nAvailable endpoints:")
     print("- GET  /health")
     print("- GET  /")
     print("- POST /v1/api/infer")
     print("- POST /api/spam")
     
-    app.run(
+    # Production-optimized Uvicorn configuration
+    uvicorn.run(
+        "main:app",
         host="0.0.0.0",
         port=8990,
-        debug=False,
-        threaded=True
+        workers=1,  # Single worker for GPU sharing
+        loop="uvloop",  # High-performance event loop
+        http="httptools",  # High-performance HTTP parser
+        access_log=False,  # Disable access logs for performance
+        log_level="info",
+        reload=False,
+        # Performance optimizations
+        backlog=2048,  # Increase connection backlog
+        limit_concurrency=1000,  # Max concurrent connections
+        limit_max_requests=10000,  # Max requests per worker
+        timeout_keep_alive=5,  # Keep-alive timeout
+        timeout_graceful_shutdown=30,  # Graceful shutdown timeout
     )

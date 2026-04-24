@@ -1,0 +1,35 @@
+# Core ML dependencies
+torch==2.5.1+cu121
+transformers==4.44.2
+tokenizers==0.19.1
+accelerate==1.13.0
+safetensors==0.7.0
+
+# FastAPI and ASGI servers
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+gunicorn==23.0.0
+hypercorn==0.17.3
+
+# HTTP and async libraries
+httpx==0.28.1
+httptools==0.7.1
+uvloop==0.22.1
+websockets==16.0
+
+# Data processing
+numpy==2.2.6
+pandas==2.3.3
+pydantic==2.13.3
+
+# System utilities
+psutil==7.2.2
+python-dotenv==1.2.2
+
+# Optional: Monitoring and caching
+prometheus-client==0.21.1
+redis==5.2.1
+
+# Optional: Database connections (if needed)
+# asyncpg==0.30.0
+# aiomysql==0.2.0
