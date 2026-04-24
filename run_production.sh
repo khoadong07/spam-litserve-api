@@ -18,7 +18,7 @@ PORT=${PORT:-8990}
 WORKERS=${WORKERS:-"1"}  # Default 1 for GPU safety
 SERVER=${SERVER:-"uvicorn"}  # Changed default to uvicorn for better CUDA support
 ML_ENABLE=${ML_ENABLE:-"true"}
-VENV_PATH=${VENV_PATH:-"venv"}
+VENV_PATH=${VENV_PATH:-".venv"}  # Use existing .venv
 
 # Function to print colored output
 print_status() {
@@ -40,17 +40,14 @@ print_error() {
 # Check if virtual environment exists
 check_venv() {
     if [ ! -d "$VENV_PATH" ]; then
-        print_warning "Virtual environment not found at $VENV_PATH"
-        print_status "Creating virtual environment..."
-        python3 -m venv "$VENV_PATH"
-        source "$VENV_PATH/bin/activate"
-        pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install gunicorn uvicorn[standard]
-        print_success "Virtual environment created and dependencies installed"
+        print_error "Virtual environment not found at $VENV_PATH"
+        print_status "Please create virtual environment first:"
+        echo "  python3 -m venv $VENV_PATH"
+        echo "  source $VENV_PATH/bin/activate"
+        echo "  pip install -r requirements.txt"
+        exit 1
     else
         print_success "Virtual environment found at $VENV_PATH"
-        source "$VENV_PATH/bin/activate"
     fi
 }
 
@@ -112,30 +109,56 @@ check_requirements() {
 check_dependencies() {
     print_status "Checking Python dependencies..."
     
+    # Use smart installer for better compatibility
+    if [ -f "install_deps.py" ]; then
+        print_status "Using smart dependency installer..."
+        python install_deps.py || {
+            print_warning "Smart installer failed, trying manual installation..."
+            manual_install_deps
+        }
+    else
+        manual_install_deps
+    fi
+    
+    print_success "Dependencies checked"
+}
+
+# Manual dependency installation fallback
+manual_install_deps() {
     # Check if required packages are installed
     python -c "import torch; print(f'PyTorch: {torch.__version__}')" 2>/dev/null || {
-        print_warning "PyTorch not found. Installing dependencies..."
-        pip install -r requirements.txt
+        print_warning "PyTorch not found. Installing compatible version..."
+        
+        # Try different PyTorch versions based on Python
+        PYTHON_VERSION=$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+        
+        if python -c "import sys; exit(0 if sys.version_info >= (3, 11) else 1)" 2>/dev/null; then
+            # Python 3.11+ - try latest
+            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || \
+            pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+        else
+            # Python < 3.11 - use compatible versions
+            pip install "torch>=2.0.0,<2.3.0" "torchvision>=0.15.0,<0.18.0" "torchaudio>=2.0.0,<2.3.0" --index-url https://download.pytorch.org/whl/cu118 || \
+            pip install "torch>=2.0.0,<2.3.0" "torchvision>=0.15.0,<0.18.0" "torchaudio>=2.0.0,<2.3.0" --index-url https://download.pytorch.org/whl/cpu
+        fi
     }
     
     python -c "import transformers; print(f'Transformers: {transformers.__version__}')" 2>/dev/null || {
-        print_warning "Transformers not found. Installing dependencies..."
-        pip install -r requirements.txt
+        print_warning "Transformers not found. Installing compatible version..."
+        pip install "transformers>=4.30.0,<4.45.0"
     }
     
     python -c "import fastapi; print(f'FastAPI: {fastapi.__version__}')" 2>/dev/null || {
-        print_warning "FastAPI not found. Installing dependencies..."
-        pip install -r requirements.txt
+        print_warning "FastAPI not found. Installing..."
+        pip install "fastapi>=0.100.0" "uvicorn[standard]>=0.20.0"
     }
     
     # Check server dependencies
     if [ "$SERVER" = "gunicorn" ]; then
-        python -c "import gunicorn" 2>/dev/null || pip install gunicorn
+        python -c "import gunicorn" 2>/dev/null || pip install "gunicorn>=20.0.0"
     elif [ "$SERVER" = "uvicorn" ]; then
-        python -c "import uvicorn" 2>/dev/null || pip install uvicorn[standard]
+        python -c "import uvicorn" 2>/dev/null || pip install "uvicorn[standard]>=0.20.0"
     fi
-    
-    print_success "Dependencies checked"
 }
 
 # Optimize system settings (CUDA-safe)
@@ -277,7 +300,7 @@ show_usage() {
     echo "  WORKERS               Number of workers (default: 1 for GPU safety)"
     echo "  SERVER                Server type: gunicorn|uvicorn|python (default: uvicorn)"
     echo "  ML_ENABLE             Enable ML inference (default: true)"
-    echo "  VENV_PATH             Virtual environment path (default: venv)"
+    echo "  VENV_PATH             Virtual environment path (default: .venv)"
     echo ""
     echo "Examples:"
     echo "  $0                                    # Start with CUDA-safe defaults"
@@ -301,30 +324,33 @@ show_usage() {
     echo "  python3 run.py                       # Ultra-simple runner"
 }
 
-# Setup function
+# Setup function (simplified - no venv creation)
 run_setup() {
-    print_status "Running quick setup..."
+    print_status "Running quick dependency check..."
     
-    # Create virtual environment if it doesn't exist
+    # Just activate existing venv and check dependencies
     if [ ! -d "$VENV_PATH" ]; then
-        print_status "Creating virtual environment..."
-        python3 -m venv "$VENV_PATH"
+        print_error "Virtual environment not found at $VENV_PATH"
+        print_status "Please create it first: python3 -m venv $VENV_PATH"
+        exit 1
     fi
     
-    # Activate and install dependencies
     source "$VENV_PATH/bin/activate"
-    pip install --upgrade pip setuptools wheel
     
-    if [ -f "requirements.production.txt" ]; then
-        pip install -r requirements.production.txt
-    else
-        pip install -r requirements.txt
-    fi
+    # Check if basic packages exist, install if missing
+    python -c "import torch, transformers, fastapi" 2>/dev/null || {
+        print_status "Installing missing dependencies..."
+        pip install -r requirements.txt 2>/dev/null || {
+            print_status "Using smart installer..."
+            python install_deps.py
+        }
+    }
     
-    # Install production servers
-    pip install gunicorn uvicorn[standard]
+    # Install production servers if missing
+    python -c "import gunicorn" 2>/dev/null || pip install gunicorn
+    python -c "import uvicorn" 2>/dev/null || pip install uvicorn[standard]
     
-    print_success "Quick setup completed"
+    print_success "Dependencies checked"
 }
 
 # Cleanup function
